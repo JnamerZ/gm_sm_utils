@@ -266,11 +266,11 @@ static int do_sm4_aead(const char *mode, const char *op,
     }
 
     EVP_CIPHER_CTX_free(ctx);
-    free(key); free(iv); free(in); free(out); free(aad);
+    free(key); free(iv); free(in); free(out); free(aad); free(dec_tag);
     EVP_CIPHER_free((EVP_CIPHER *)cipher);
     return 0;
 err:
-    free(key); free(iv); free(in); free(out); free(aad);
+    free(key); free(iv); free(in); free(out); free(aad); free(dec_tag);
     if (cipher) EVP_CIPHER_free((EVP_CIPHER *)cipher);
     return 1;
 }
