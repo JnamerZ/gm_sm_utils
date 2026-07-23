@@ -1,0 +1,5 @@
+gmssl
+# 编译 openssl_sm_helper.c 需要系统环境：
+#   - OpenSSL 3.x（支持 SM2/SM3/SM4）
+#   - libssl-dev / openssl-devel（头文件）
+#   - gcc
