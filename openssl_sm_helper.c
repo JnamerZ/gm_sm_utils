@@ -7,8 +7,10 @@
  *   ./openssl_sm_helper sm4 <mode> <enc|dec> <key_hex> <iv_hex> <in_hex>
  *        mode: ecb/cbc/cfb/ofb/ctr/xts
  *
- *   ./openssl_sm_helper sm4_gcm <enc|dec> <key_hex> <iv_hex> <in_hex> [aad_hex] [tag_hex]
- *   ./openssl_sm_helper sm4_ccm <enc|dec> <key_hex> <iv_hex> <in_hex> [aad_hex] [tag_hex]
+ *   ./openssl_sm_helper sm4_gcm enc <key_hex> <iv_hex> <pt_hex> [aad_hex]
+ *   ./openssl_sm_helper sm4_gcm dec <key_hex> <iv_hex> <ct_hex> [aad_hex] <tag_hex>
+ *   ./openssl_sm_helper sm4_ccm enc <key_hex> <iv_hex> <pt_hex> [aad_hex]
+ *   ./openssl_sm_helper sm4_ccm dec <key_hex> <iv_hex> <ct_hex> [aad_hex] <tag_hex>
  *
  *   ./openssl_sm_helper sm2_pubkey <d_hex>
  *   ./openssl_sm_helper sm2_sign <d_hex> <msg_hex> [sm2_id]
@@ -33,7 +35,6 @@
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/core_names.h>
-#include <openssl/param_build.h>
 
 static void print_err(const char *msg)
 {
@@ -49,6 +50,11 @@ static int hex_to_bytes(const char *hex, unsigned char **out, size_t *out_len)
         return 0;
     }
     size_t blen = len / 2;
+    if (blen == 0) {
+        *out = NULL;
+        *out_len = 0;
+        return 1;
+    }
     unsigned char *buf = malloc(blen);
     if (!buf) return 0;
     for (size_t i = 0; i < blen; i++) {
@@ -126,8 +132,12 @@ static int do_sm4(const char *mode, const char *op,
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (!ctx) { print_err("EVP_CIPHER_CTX_new"); goto err; }
 
-    if (!EVP_CipherInit_ex2(ctx, cipher, key, iv, encrypt, NULL)) {
+    /* XTS 必须分两步设置 key/iv，否则 OpenSSL 会错误处理 tweak */
+    if (!EVP_CipherInit_ex2(ctx, cipher, NULL, NULL, encrypt, NULL)) {
         print_err("EVP_CipherInit_ex2"); EVP_CIPHER_CTX_free(ctx); goto err;
+    }
+    if (!EVP_CipherInit_ex2(ctx, NULL, key, iv, encrypt, NULL)) {
+        print_err("EVP_CipherInit_ex2 key/iv"); EVP_CIPHER_CTX_free(ctx); goto err;
     }
     if (strcmp(mode, "ecb") == 0 || strcmp(mode, "cbc") == 0) {
         EVP_CIPHER_CTX_set_padding(ctx, 0);
@@ -343,80 +353,93 @@ static int do_sm2_sign(const char *d_hex, const char *msg_hex, const char *sm2_i
 {
     /* 先生成 pkey（复用 sm2_pubkey 逻辑会简洁一些），这里直接构造 */
     /* 为简化，先创建临时 SM2 key，再替换私钥 */
-    unsigned char *d_bytes = NULL, *msg = NULL;
+    unsigned char *d_bytes = NULL, *msg = NULL, *sig = NULL;
     size_t d_len = 0, msg_len = 0;
+    EVP_PKEY_CTX *kg = NULL;
+    EVP_PKEY *pkey = NULL;
+    EC_KEY *ec = NULL;
+    BIGNUM *d = NULL;
+    EC_POINT *pub = NULL;
+    EVP_MD_CTX *ctx = NULL;
+    int success = 0;
+
     if (!hex_to_bytes(d_hex, &d_bytes, &d_len)) return 1;
-    if (!hex_to_bytes(msg_hex, &msg, &msg_len)) { free(d_bytes); return 1; }
+    if (!hex_to_bytes(msg_hex, &msg, &msg_len)) goto cleanup;
     const char *id = sm2_id ? sm2_id : "";
     size_t id_len = strlen(id);
 
     /* 创建临时 SM2 key */
-    EVP_PKEY_CTX *kg = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
-    if (!kg) { print_err("EVP_PKEY_CTX_new_id"); goto err; }
+    kg = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+    if (!kg) { print_err("EVP_PKEY_CTX_new_id"); goto cleanup; }
     if (EVP_PKEY_keygen_init(kg) <= 0 ||
         EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kg, NID_sm2) <= 0) {
-        print_err("SM2 keygen init"); EVP_PKEY_CTX_free(kg); goto err;
+        print_err("SM2 keygen init"); goto cleanup;
     }
-    EVP_PKEY *pkey = NULL;
     if (EVP_PKEY_keygen(kg, &pkey) <= 0) {
-        print_err("EVP_PKEY_keygen"); EVP_PKEY_CTX_free(kg); goto err;
+        print_err("EVP_PKEY_keygen"); goto cleanup;
     }
-    EVP_PKEY_CTX_free(kg);
+    EVP_PKEY_CTX_free(kg); kg = NULL;
 
-    EC_KEY *ec = EVP_PKEY_get1_EC_KEY(pkey);
-    if (!ec) { print_err("EVP_PKEY_get1_EC_KEY"); EVP_PKEY_free(pkey); goto err; }
-    BIGNUM *d = BN_bin2bn(d_bytes, d_len, NULL);
-    if (!d) { print_err("BN_bin2bn"); EC_KEY_free(ec); EVP_PKEY_free(pkey); goto err; }
+    ec = EVP_PKEY_get1_EC_KEY(pkey);
+    if (!ec) { print_err("EVP_PKEY_get1_EC_KEY"); goto cleanup; }
+    d = BN_bin2bn(d_bytes, d_len, NULL);
+    if (!d) { print_err("BN_bin2bn"); goto cleanup; }
     if (!EC_KEY_set_private_key(ec, d)) {
-        print_err("EC_KEY_set_private_key"); BN_free(d); EC_KEY_free(ec); EVP_PKEY_free(pkey); goto err;
+        print_err("EC_KEY_set_private_key"); goto cleanup;
     }
-    BN_free(d);
+    BN_free(d); d = NULL;
 
-    EC_POINT *pub = EC_POINT_new(EC_KEY_get0_group(ec));
-    if (!pub) { print_err("EC_POINT_new"); EC_KEY_free(ec); EVP_PKEY_free(pkey); goto err; }
+    pub = EC_POINT_new(EC_KEY_get0_group(ec));
+    if (!pub) { print_err("EC_POINT_new"); goto cleanup; }
     const BIGNUM *dtmp = EC_KEY_get0_private_key(ec);
     if (!EC_POINT_mul(EC_KEY_get0_group(ec), pub, dtmp, NULL, NULL, NULL)) {
-        print_err("EC_POINT_mul"); EC_POINT_free(pub); EC_KEY_free(ec); EVP_PKEY_free(pkey); goto err;
+        print_err("EC_POINT_mul"); goto cleanup;
     }
     if (!EC_KEY_set_public_key(ec, pub)) {
-        print_err("EC_KEY_set_public_key"); EC_POINT_free(pub); EC_KEY_free(ec); EVP_PKEY_free(pkey); goto err;
+        print_err("EC_KEY_set_public_key"); goto cleanup;
     }
-    EC_POINT_free(pub);
+    EC_POINT_free(pub); pub = NULL;
 
     if (!EVP_PKEY_set1_EC_KEY(pkey, ec)) {
-        print_err("EVP_PKEY_set1_EC_KEY"); EC_KEY_free(ec); EVP_PKEY_free(pkey); goto err;
+        print_err("EVP_PKEY_set1_EC_KEY"); goto cleanup;
     }
-    EC_KEY_free(ec);
+    EC_KEY_free(ec); ec = NULL;
 
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    if (!ctx) { print_err("EVP_MD_CTX_new"); EVP_PKEY_free(pkey); goto err; }
+    ctx = EVP_MD_CTX_new();
+    if (!ctx) { print_err("EVP_MD_CTX_new"); goto cleanup; }
     EVP_PKEY_CTX *pctx = NULL;
     if (!EVP_DigestSignInit(ctx, &pctx, EVP_sm3(), NULL, pkey)) {
-        print_err("EVP_DigestSignInit"); EVP_MD_CTX_free(ctx); EVP_PKEY_free(pkey); goto err;
+        print_err("EVP_DigestSignInit"); goto cleanup;
     }
     /* 默认空 ID，与 OpenSSL CLI 默认行为一致；可通过 sm2_id 指定 */
     if (EVP_PKEY_CTX_set1_id(pctx, id, (int)id_len) <= 0) {
-        print_err("EVP_PKEY_CTX_set1_id"); EVP_MD_CTX_free(ctx); EVP_PKEY_free(pkey); goto err;
+        print_err("EVP_PKEY_CTX_set1_id"); goto cleanup;
     }
 
     size_t sig_len = 0;
     if (!EVP_DigestSign(ctx, NULL, &sig_len, msg, msg_len)) {
-        print_err("EVP_DigestSign length"); EVP_MD_CTX_free(ctx); EVP_PKEY_free(pkey); goto err;
+        print_err("EVP_DigestSign length"); goto cleanup;
     }
-    unsigned char *sig = malloc(sig_len);
-    if (!sig) { print_err("malloc"); EVP_MD_CTX_free(ctx); EVP_PKEY_free(pkey); goto err; }
+    sig = malloc(sig_len);
+    if (!sig) { print_err("malloc"); goto cleanup; }
     if (!EVP_DigestSign(ctx, sig, &sig_len, msg, msg_len)) {
-        print_err("EVP_DigestSign"); free(sig); EVP_MD_CTX_free(ctx); EVP_PKEY_free(pkey); goto err;
+        print_err("EVP_DigestSign"); goto cleanup;
     }
-    EVP_MD_CTX_free(ctx); EVP_PKEY_free(pkey);
-    free(d_bytes); free(msg);
-    print_hex(sig, sig_len);
-    free(sig);
-    return 0;
 
-err:
-    free(d_bytes); free(msg);
-    return 1;
+    print_hex(sig, sig_len);
+    success = 1;
+
+cleanup:
+    free(sig);
+    EVP_MD_CTX_free(ctx);
+    EC_POINT_free(pub);
+    BN_free(d);
+    EC_KEY_free(ec);
+    EVP_PKEY_free(pkey);
+    EVP_PKEY_CTX_free(kg);
+    free(d_bytes);
+    free(msg);
+    return success ? 0 : 1;
 }
 
 static int do_sm2_verify(const char *pub_hex, const char *sig_hex, const char *msg_hex, const char *sm2_id)
@@ -429,8 +452,7 @@ static int do_sm2_verify(const char *pub_hex, const char *sig_hex, const char *m
     const char *id = sm2_id ? sm2_id : "";
     size_t id_len = strlen(id);
 
-    EVP_PKEY *pkey = EVP_PKEY_new();
-    if (!pkey) { print_err("EVP_PKEY_new"); goto err; }
+    EVP_PKEY *pkey = NULL;
 
     OSSL_PARAM params[3];
     params[0] = OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, "SM2", 0);
@@ -461,6 +483,7 @@ static int do_sm2_verify(const char *pub_hex, const char *sig_hex, const char *m
     printf("%d\n", ret);
     return 0;
 err:
+    EVP_PKEY_free(pkey);
     free(pub); free(sig); free(msg);
     return 1;
 }

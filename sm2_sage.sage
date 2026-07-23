@@ -35,7 +35,7 @@ import binascii
 import hashlib
 import os
 import struct
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 # 如果可用，使用 Cryptodome 的 ASN.1 编码；否则内置一个最小 DerInteger/DerSequence
 # SageMath 通常自带 pycryptodome，但这里提供 fallback 以便纯 Sage 环境运行。
@@ -284,7 +284,6 @@ class SM2Keys:
     def __init__(self, params: SM2Params):
         self.params = params
         self.curve = SM2Curve(params)
-        self._h = params.n.bit_length() // 2  # SM2 推荐 128-bit 安全参数
 
     # ---------------------------------------------------------------------
     # 密钥相关
@@ -297,9 +296,15 @@ class SM2Keys:
         return d, self.public_key_from_private(d)
 
     def public_key_from_private(self, d: Union[int, str]) -> str:
-        """由私钥 d（10 进制或 hex）计算 04 开头公钥。"""
+        """由私钥 d（10 进制整数或 16 进制字符串）计算 04 开头公钥。"""
         if isinstance(d, str):
-            d = int(d, 16)
+            d = d.strip()
+            if d.startswith(("0x", "0X")):
+                d = int(d[2:], 16)
+            elif len(d) == 64 or any(c in "abcdefABCDEF" for c in d):
+                d = int(d, 16)
+            else:
+                d = int(d)
         if not (1 <= d < self.params.n):
             raise ValueError("private key out of range")
         x, y = self.curve.public_key_from_private(d)
@@ -311,7 +316,7 @@ class SM2Keys:
 
     @staticmethod
     def sm3_hash(data: bytes) -> bytes:
-        """优先使用 gmssl.sm3；不可用则退回到 hashlib.sm3（Python 3.11+）。"""
+        """优先使用 gmssl.sm3；不可用则退回到 hashlib.sm3（依赖 OpenSSL 支持 SM3）。"""
         try:
             from gmssl import sm3, func
             return bytes.fromhex(sm3.sm3_hash(func.bytes_to_list(data)))

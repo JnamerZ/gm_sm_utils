@@ -82,7 +82,7 @@ digest = sm3_hash(b"abc")
 # '66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0'
 
 # 生成 SM3 哈希之前的完整填充后输入（bytes）
-# 规则：原始消息 || 0x80 || 0x00... || 64 bit 大端长度
+# 规则：原始消息 || 0x80 || 0x00... || 64-bit 大端长度
 padded = sm3_padding(b"abc")
 print(padded.hex())
 ```
@@ -172,11 +172,14 @@ tree[0]["children"][0]          # 第一层第一个子节点
 node = ASN1Utils.get_node(tree, [0, 0, 1])   # 指定路径
 
 # 修改节点值后重新打包（int 会被编码为 DerInteger 的 value 部分，外层 tag 不变）
+# 注意：set_node_value 会就地修改传入的 tree，返回新的 DER
 new_der = ASN1Utils.set_node_value(tree, [0, 0, 1], 0x12345678)
 
 # 自定义编码器：把 bytes 编码为 BIT STRING 的 value 部分（首字节为未使用位数 0）
+# 如需再次独立修改，请重新 parse_der(der) 得到新的 tree
+tree2 = ASN1Utils.parse_der(der)
 new_der2 = ASN1Utils.set_node_value(
-    tree, [0, 0, 1], b"new_value",
+    tree2, [0, 0, 1], b"new_value",
     value_encoder=lambda x: bytes([0x00]) + x
 )
 
@@ -362,8 +365,9 @@ for (int i = 0; i < 5; i++) {
 ```c
 #include <openssl/evp.h>
 
+const EVP_CIPHER *cipher = EVP_CIPHER_fetch(NULL, "SM4-GCM", NULL);
 EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-EVP_CipherInit_ex2(ctx, EVP_CIPHER_fetch(NULL, "SM4-GCM", NULL), NULL, NULL, 1, NULL);
+EVP_CipherInit_ex2(ctx, cipher, NULL, NULL, 1, NULL);
 EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, iv_len, NULL);
 EVP_CipherInit_ex2(ctx, NULL, key, iv, 1, NULL);
 
@@ -376,6 +380,7 @@ EVP_CipherUpdate(ctx, ct, &out_len1, pt, pt_len);
 EVP_CipherFinal_ex(ctx, ct + out_len1, &out_len2);
 EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag);
 EVP_CIPHER_CTX_free(ctx);
+EVP_CIPHER_free((EVP_CIPHER *)cipher);
 ```
 
 ##### SM2 公钥派生
@@ -460,7 +465,8 @@ EVP_DigestSign(ctx, NULL, &sig_len, msg, msg_len);
 unsigned char *sig = malloc(sig_len);
 EVP_DigestSign(ctx, sig, &sig_len, msg, msg_len);
 EVP_MD_CTX_free(ctx);
-// sig[0..sig_len-1] 为 DER 格式签名
+// sig[0..sig_len-1] 为 DER 格式签名；用完后 free(sig)
+free(sig);
 ```
 
 ##### SM2 验签
@@ -472,6 +478,7 @@ EVP_DigestVerifyInit(ctx, &pctx, EVP_sm3(), NULL, pkey);
 EVP_PKEY_CTX_set1_id(pctx, sm2_id, strlen(sm2_id));
 int ret = EVP_DigestVerify(ctx, sig, sig_len, msg, msg_len);
 EVP_MD_CTX_free(ctx);
+EVP_PKEY_free(pkey);
 // ret == 1 表示验证成功
 ```
 
@@ -480,6 +487,7 @@ EVP_MD_CTX_free(ctx);
 ### `sm4_modes.py` — Python 手工实现 SM4 全模式
 
 **设计**：ECB 直接调用 gmssl 单分组接口作为黑盒，其余模式全部用 Python 手写，方便在 CTF 中魔改或分析中间状态。
+XTS 默认严格遵循 IEEE P1619，同时提供 `standard="GB"` 选项以匹配 OpenSSL 默认的 GB/T 17964-2021 实现；`openssl enc` CLI 不支持 XTS。
 
 ```python
 from sm4_modes import SM4Modes
@@ -517,12 +525,17 @@ ct, tag = SM4Modes.ccm_encrypt(key, iv[:12], pt, aad=b"meta")
 pt2 = SM4Modes.ccm_decrypt(key, iv[:12], ct, aad=b"meta", tag=tag)
 
 # XTS（key 为 32 字节：key1 || key2；tweak 为 16 字节数据单元号）
+# 默认遵循 IEEE P1619
 xts_key = key + key
 ct = SM4Modes.xts_encrypt(xts_key, iv, pt)
 pt2 = SM4Modes.xts_decrypt(xts_key, iv, ct)
+
+# 若题目数据来自 OpenSSL 默认的 SM4-XTS，使用 GB/T 17964-2021 标准
+ct_gb = SM4Modes.xts_encrypt_gb(xts_key, iv, pt)
+pt2_gb = SM4Modes.xts_decrypt_gb(xts_key, iv, ct_gb)
 ```
 
-> 注意：`XTS` 严格遵循 IEEE P1619。OpenSSL 的 `SM4-XTS` tweak 更新与之存在差异，因此本实现与 OpenSSL 的 SM4-XTS 不保证字节级一致，但 roundtrip 自洽。
+> 注意：`XTS` 默认遵循 IEEE P1619。OpenSSL 的 `SM4-XTS` 默认采用 GB/T 17964-2021，两者 tweak 更新方向不同；本模块通过 `standard="GB"` 或 `xts_encrypt_gb` / `xts_decrypt_gb` 提供 GB 标准实现，可与 OpenSSL EVP API 字节级对齐。`openssl enc` CLI 不支持 XTS，故不通过 CLI 直接验证。
 
 ---
 
@@ -589,7 +602,7 @@ make test-verify-gmssl
 - SM2 签名互验（国密默认 ID）
 - ASN.1 DER 签名解析与重打包
 
-> 注意：`sm4_modes.py` 的 XTS 严格遵循 IEEE P1619，与 OpenSSL 的 `SM4-XTS` 实现字节级不一致；GCM/CCM 因 `openssl enc` CLI 不支持 AAD/tag 而无法直接通过 CLI 验证。
+> 注意：`sm4_modes.py` 的 XTS 默认遵循 IEEE P1619，同时提供 `standard="GB"` 以匹配 OpenSSL 默认的 GB/T 17964-2021 实现；GCM/CCM 因 `openssl enc` CLI 不支持 AAD/tag 而无法直接通过 CLI 验证，XTS 因 `openssl enc` CLI 不支持而无法直接通过 CLI 验证。
 
 ---
 
@@ -687,14 +700,14 @@ make help                 # 查看目标说明
 **Q: 为什么 `openssl_sm_helper.c` 用到了 deprecated 的 EC API？**  
 A: 为了代码简洁，直接用 `EC_KEY_*` 派生公钥与设置私钥。编译时通过 `-Wno-deprecated-declarations` 抑制警告，功能在 OpenSSL 3.x 下正常。
 
-**Q: `sm4_modes.py` 的 XTS 为什么不与 OpenSSL 一致？**  
-A: 本实现严格按 IEEE P1619 标准。实测 OpenSSL 的 `SM4-XTS` tweak 更新与标准实现存在差异，因此仅保证 roundtrip 自洽。
+**Q: `sm4_modes.py` 的 XTS 与 OpenSSL 是否一致？**  
+A: `sm4_modes.xts_encrypt` 默认遵循 IEEE P1619；同时提供 `standard="GB"`（或 `xts_encrypt_gb` / `xts_decrypt_gb`）以匹配 OpenSSL 默认采用的 GB/T 17964-2021。`openssl enc` CLI 不支持 XTS，因此不通过 CLI 直接验证。
 
 **Q: `openssl_sm_helper` 的 SM2 签名为什么和 `openssl dgst -sm3 -sign` 默认结果不同？**  
 A: SM2 签名依赖一个“用户标识 ID”。系统 OpenSSL CLI 默认使用**空 ID**；helper 默认也使用空 ID，因此二者可直接互验。而 `utils.py`、`sm2_sage.sage`、gmssl 默认使用国密推荐 ID 字符串 `"1234567812345678"`。helper 可通过第 4 个参数指定该 ID，与它们互验。
 
 **Q: 为什么不能用 `openssl enc -sm4-gcm` 直接验证 `sm4_modes.py` 的 GCM/CCM/XTS？**  
-A: `openssl enc` 命令不支持 AEAD 模式的 AAD/tag 选项，也不支持 XTS。因此 GCM/CCM/XTS 只能与 helper（OpenSSL EVP API）或自身做 roundtrip 验证；非 AEAD 模式（ECB/CBC/CFB/OFB/CTR）可直接与 `openssl enc` 字节级对齐。
+A: `openssl enc` 命令不支持 AEAD 模式的 AAD/tag 选项，也不支持 XTS。GCM/CCM 可与 helper（OpenSSL EVP API）做字节级一致性验证；XTS 默认遵循 IEEE P1619，也可通过 `standard="GB"` 匹配 OpenSSL 默认的 GB/T 17964-2021。非 AEAD 模式（ECB/CBC/CFB/OFB/CTR）可直接与 `openssl enc` CLI 字节级对齐。
 
 **Q: gmssl 的 `CryptSM4.crypt_ecb` 会 padding，怎么得到原始 16 字节分组？**  
 A: `sm4_modes.py` 使用 `CryptSM4.one_round` 直接做单轮加解密，绕过 padding。

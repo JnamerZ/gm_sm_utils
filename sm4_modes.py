@@ -6,8 +6,8 @@ SM4 分组密码工作模式纯 Python 实现
     - ECB 仅作为“黑盒”直接调用 gmssl.sm4 的单分组加/解密接口 one_round。
     - CBC / CFB / OFB / CTR / GCM / CCM / XTS 均在本文件中手工实现。
     - 所有接口均支持自定义 key / iv（或 nonce/tweak）/ plaintext / ciphertext / aad / tag。
-    - 注意：XTS 严格遵循 IEEE P1619；OpenSSL 的 SM4-XTS tweak 更新与之存在差异，
-      因此本实现与 OpenSSL 的 SM4-XTS 不保证字节级一致，但 roundtrip 自洽。
+    - 注意：XTS 默认严格遵循 IEEE P1619；同时提供 standard="GB"（以及 xts_encrypt_gb /
+      xts_decrypt_gb 便捷函数）以匹配 OpenSSL 默认采用的 GB/T 17964-2021。
 
 依赖：
     pip install gmssl
@@ -199,15 +199,48 @@ def _ccm_ctr_counter(nonce: bytes, i: int) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# XTS 辅助：GF(2^128) 乘 alpha = x（即左移 1 位，最高位出则异或 0x87）
+# XTS 辅助：支持 IEEE P1619 与 GB/T 17964-2021 两种 tweak 更新
 # ---------------------------------------------------------------------------
 
-def _xts_mul_alpha(tweak: int) -> int:
-    """XTS tweak 更新：T = T * α in GF(2^128)[x]/x^128+x^7+x^2+x+1 的变体。"""
-    # IEEE P1619/XTS 使用的 alpha 乘法是左移 1 位，若原最高位为 1 则 XOR 0x87
-    if tweak & (1 << 127):
-        return ((tweak << 1) & ((1 << 128) - 1)) ^ 0x87
-    return (tweak << 1) & ((1 << 128) - 1)
+def _xts_mul_alpha_ieee(tweak: int) -> int:
+    """IEEE P1619 小端字节序 tweak 更新：T = T * α。"""
+    b = tweak.to_bytes(16, "little")
+    carry = 0x87 if b[15] & 0x80 else 0
+    new_b = bytearray(16)
+    for i in range(15):
+        new_b[i] = ((b[i] << 1) | (b[i + 1] >> 7)) & 0xFF
+    new_b[15] = ((b[15] << 1) ^ carry) & 0xFF
+    return int.from_bytes(new_b, "little")
+
+
+def _bswap64(x: int) -> int:
+    """64 位整数字节反转。"""
+    return int.from_bytes(int.to_bytes(x & 0xFFFFFFFFFFFFFFFF, 8, "little")[::-1], "little")
+
+
+def _xts_mul_alpha_gb(tweak: int) -> int:
+    """GB/T 17964-2021 tweak 更新，与 OpenSSL SM4-XTS 默认行为一致。"""
+    c = bytearray(tweak.to_bytes(16, "little"))
+    u0 = int.from_bytes(c[0:8], "little")
+    u1 = int.from_bytes(c[8:16], "little")
+    hi = _bswap64(u0)
+    lo = _bswap64(u1)
+    res = lo & 1
+    u0 = ((lo >> 1) | (hi << 63)) & 0xFFFFFFFFFFFFFFFF
+    u1 = (hi >> 1) & 0xFFFFFFFFFFFFFFFF
+    c[0:8] = int.to_bytes(u0, 8, "little")
+    c[8:16] = int.to_bytes(u1, 8, "little")
+    if res:
+        c[15] ^= 0xE1
+    u0 = int.from_bytes(c[0:8], "little")
+    u1 = int.from_bytes(c[8:16], "little")
+    hi = _bswap64(u0)
+    lo = _bswap64(u1)
+    u0 = lo
+    u1 = hi
+    c[0:8] = int.to_bytes(u0, 8, "little")
+    c[8:16] = int.to_bytes(u1, 8, "little")
+    return int.from_bytes(c, "little")
 
 
 # ---------------------------------------------------------------------------
@@ -485,10 +518,20 @@ class SM4Modes:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def xts_encrypt(key: bytes, tweak: bytes, plaintext: bytes) -> bytes:
+    def xts_encrypt(
+        key: bytes,
+        tweak: bytes,
+        plaintext: bytes,
+        *,
+        standard: str = "IEEE",
+    ) -> bytes:
         """
         XTS 加密。key 为 32 字节（key1 || key2），tweak 为 16 字节数据单元号。
         当前实现不支持 ciphertext-stealing，因此输入长度需为 16 字节倍数。
+
+        Args:
+            standard: "IEEE" 遵循 IEEE P1619；"GB" 遵循 GB/T 17964-2021
+                      （与 OpenSSL 默认 SM4-XTS 字节级一致）。
         """
         if len(key) != 32:
             raise ValueError("XTS key must be 32 bytes (key1 || key2)")
@@ -496,37 +539,67 @@ class SM4Modes:
             raise ValueError("XTS tweak must be 16 bytes")
         if len(plaintext) % 16 != 0:
             raise ValueError("XTS plaintext length must be multiple of 16 (no ciphertext stealing)")
+        if standard not in ("IEEE", "GB"):
+            raise ValueError("standard must be 'IEEE' or 'GB'")
+
         key1, key2 = key[:16], key[16:]
-        t = _bytes_to_int(_SM4Block.encrypt(key2, tweak))
+        mul_fn = _xts_mul_alpha_gb if standard == "GB" else _xts_mul_alpha_ieee
+        t = int.from_bytes(_SM4Block.encrypt(key2, tweak), "little")
         out = bytearray()
         for i in range(0, len(plaintext), 16):
-            t_bytes = _int_to_bytes(t)
+            t_bytes = t.to_bytes(16, "little")
             block = plaintext[i : i + 16]
             pp = _xor(block, t_bytes)
             cc = _SM4Block.encrypt(key1, pp)
             out.extend(_xor(cc, t_bytes))
-            t = _xts_mul_alpha(t)
+            t = mul_fn(t)
         return bytes(out)
 
     @staticmethod
-    def xts_decrypt(key: bytes, tweak: bytes, ciphertext: bytes) -> bytes:
+    def xts_decrypt(
+        key: bytes,
+        tweak: bytes,
+        ciphertext: bytes,
+        *,
+        standard: str = "IEEE",
+    ) -> bytes:
+        """
+        XTS 解密。
+
+        Args:
+            standard: "IEEE" 或 "GB"，需与加密时一致。
+        """
         if len(key) != 32:
             raise ValueError("XTS key must be 32 bytes (key1 || key2)")
         if len(tweak) != 16:
             raise ValueError("XTS tweak must be 16 bytes")
         if len(ciphertext) % 16 != 0:
             raise ValueError("XTS ciphertext length must be multiple of 16")
+        if standard not in ("IEEE", "GB"):
+            raise ValueError("standard must be 'IEEE' or 'GB'")
+
         key1, key2 = key[:16], key[16:]
-        t = _bytes_to_int(_SM4Block.encrypt(key2, tweak))
+        mul_fn = _xts_mul_alpha_gb if standard == "GB" else _xts_mul_alpha_ieee
+        t = int.from_bytes(_SM4Block.encrypt(key2, tweak), "little")
         out = bytearray()
         for i in range(0, len(ciphertext), 16):
-            t_bytes = _int_to_bytes(t)
+            t_bytes = t.to_bytes(16, "little")
             block = ciphertext[i : i + 16]
             cc = _xor(block, t_bytes)
             pp = _SM4Block.decrypt(key1, cc)
             out.extend(_xor(pp, t_bytes))
-            t = _xts_mul_alpha(t)
+            t = mul_fn(t)
         return bytes(out)
+
+    @staticmethod
+    def xts_encrypt_gb(key: bytes, tweak: bytes, plaintext: bytes) -> bytes:
+        """GB/T 17964-2021 标准 XTS 加密便捷函数。"""
+        return SM4Modes.xts_encrypt(key, tweak, plaintext, standard="GB")
+
+    @staticmethod
+    def xts_decrypt_gb(key: bytes, tweak: bytes, ciphertext: bytes) -> bytes:
+        """GB/T 17964-2021 标准 XTS 解密便捷函数。"""
+        return SM4Modes.xts_decrypt(key, tweak, ciphertext, standard="GB")
 
 
 # ---------------------------------------------------------------------------
@@ -568,12 +641,17 @@ def _self_test():
     assert pt2 == pt
     print(f"[CCM] roundtrip ok (tag={tag.hex()})")
 
-    # XTS
+    # XTS（IEEE P1619 默认 + GB/T 17964-2021）
     xts_key = key + key
     ct = SM4Modes.xts_encrypt(xts_key, iv, pt)
     pt2 = SM4Modes.xts_decrypt(xts_key, iv, ct)
     assert pt2 == pt
-    print("[XTS] roundtrip ok")
+    print("[XTS] IEEE roundtrip ok")
+
+    ct_gb = SM4Modes.xts_encrypt_gb(xts_key, iv, pt)
+    pt2_gb = SM4Modes.xts_decrypt_gb(xts_key, iv, ct_gb)
+    assert pt2_gb == pt
+    print("[XTS] GB roundtrip ok")
 
     # 与 OpenSSL C 辅助程序交叉验证（若存在）
     helper = Path(__file__).resolve().parent / "openssl_sm_helper"
@@ -613,8 +691,11 @@ def _self_test():
             assert tag_py.hex() == tag_ref, f"GCM iv_len={iv_len} tag mismatch"
             print(f"[GCM] iv_len={iv_len} openssl cross-check ok")
 
-        # XTS：OpenSSL 的 SM4-XTS tweak 更新与标准 IEEE P1619 存在差异，
-        # 因此本实现仅做 roundtrip 自洽验证，不做跨实现字节级比对。
+        # XTS：OpenSSL 的 SM4-XTS 默认采用 GB/T 17964-2021
+        ct_ref = run("sm4", "xts", "enc", xts_key.hex(), iv.hex(), pt.hex())
+        ct_py = SM4Modes.xts_encrypt_gb(xts_key, iv, pt).hex()
+        assert ct_py == ct_ref, "XTS GB mismatch with openssl"
+        print("[XTS-GB] openssl cross-check ok")
 
     print("=" * 60)
     print("所有 SM4 模式自测通过")

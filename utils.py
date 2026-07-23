@@ -766,7 +766,7 @@ if __name__ == "__main__":
     padded_abc = sm3_padding("616263")
     assert padded_abc.hex().startswith("61626380")
     assert len(padded_abc) % 64 == 0
-    # 最后 8 字节是原始长度 24 bit = 0x18
+    # 最后 8 字节为原始消息位长度的 64-bit 大端表示；"abc" 长度为 24 bits = 0x18
     assert padded_abc[-8:] == b"\x00\x00\x00\x00\x00\x00\x00\x18"
     # 与标准 SM3 测试向量 "abc" 的填充结果一致
     assert padded_abc.hex() == (

@@ -29,12 +29,12 @@ help:
 	@echo "  make test             运行全部自测"
 	@echo "  make test-utils       运行 utils.py 自测"
 	@echo "  make test-sage        运行 sm2_sage.sage 自测"
-	@echo "  make test-openssl        运行 OpenSSL SM2/3/4 演示自测"
-	@echo "  make test-sm4-modes      运行 sm4_modes.py 自测"
-	@echo "  make test-sm4-gcm-sage   运行 sm4_gcm_sage.sage 自测"
-	@echo "  make test-verify-openssl 以系统 openssl CLI 为基准做一致性验证"
-	@echo "  make test-verify-gmssl   以 gmssl Python 库为基准做一致性验证"
-	@echo "  make clean               清理编译产物"
+	@echo "  make test-openssl         运行 OpenSSL SM2/3/4 演示自测"
+	@echo "  make test-sm4-modes       运行 sm4_modes.py 自测"
+	@echo "  make test-sm4-gcm-sage    运行 sm4_gcm_sage.sage 自测"
+	@echo "  make test-verify-openssl  以系统 openssl CLI 为基准做一致性验证"
+	@echo "  make test-verify-gmssl    以 gmssl Python 库为基准做一致性验证"
+	@echo "  make clean                清理编译产物"
 
 all: $(HELPER)
 

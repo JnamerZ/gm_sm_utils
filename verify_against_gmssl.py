@@ -72,8 +72,7 @@ def main() -> int:
     gm_digest = gmssl_sm3_digest(msg).hex()
     checker.check("SM3: utils.py == gmssl", sm3_hash(msg) == gm_digest)
 
-    # sm2_sage.sage SM3Hash
-    # sm2_sage.sage SM3Hash
+    # sm2_sage.sage SM3 hash
     sage_sm3 = subprocess.run([SAGE, "-c",
                                f'load("{Path(__file__).resolve().parent / "sm2_sage.sage"}"); '
                                f'print(SM2Keys.sm3_hash({msg!r}).hex())'],

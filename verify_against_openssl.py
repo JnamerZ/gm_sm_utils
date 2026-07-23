@@ -138,6 +138,17 @@ def main() -> int:
                       ct_ccm.hex() == out[0] and tag_ccm.hex() == out[1])
 
         # ------------------------------------------------------------------
+        # SM4 XTS：openssl enc CLI 不支持；默认 IEEE P1619 与 OpenSSL 默认 GB 不同。
+        # 这里用 standard="GB" 与 helper（OpenSSL 默认）做字节级对比。
+        # ------------------------------------------------------------------
+        xts_key = key + key
+        ct_xts_gb = SM4Modes.xts_encrypt(xts_key, iv, pt, standard="GB")
+        ct_xts_helper = bytes.fromhex(run_helper("sm4", "xts", "enc", xts_key.hex(), iv.hex(), pt.hex())[1])
+        checker.check("SM4-XTS (GB): sm4_modes.py == helper(OpenSSL default)",
+                      ct_xts_gb == ct_xts_helper,
+                      f"py={ct_xts_gb.hex()[:32]}... helper={ct_xts_helper.hex()[:32]}...")
+
+        # ------------------------------------------------------------------
         # SM2 公钥
         # ------------------------------------------------------------------
         helper_pub = run_helper("sm2_pubkey", priv_hex)[1]
