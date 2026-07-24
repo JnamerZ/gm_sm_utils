@@ -16,6 +16,7 @@
 - [CTF 场景速查](#ctf-场景速查)
 - [Makefile 目标](#makefile-目标)
 - [常见问题](#常见问题)
+- [附录：OpenSSL 国密算法常用命令](#附录openssl-国密算法常用命令)
 
 ---
 
@@ -714,3 +715,90 @@ A: `sm4_modes.py` 使用 `CryptSM4.one_round` 直接做单轮加解密，绕过 
 
 **Q: 这些工具能在 Windows 上跑吗？**  
 A: Python 脚本可直接跑；`openssl_sm_helper.c` 需要 MSVC/MinGW 与 OpenSSL 开发库；SageMath 脚本需要 Windows 版 SageMath。
+
+---
+
+## 附录：OpenSSL 国密算法常用命令
+
+> 本附录汇总系统 `openssl` CLI 中 SM2/SM3/SM4 的常用命令，与仓库中 `openssl_sm_helper.c`、`verify_against_openssl.py` 的用法对应。
+> 系统 OpenSSL 默认 SM2 签名为**空 ID**；国密推荐默认 ID 字符串为 `1234567812345678`。
+
+### SM3 摘要
+
+```bash
+# 输出 hex
+openssl dgst -sm3 message.bin
+
+# 输出原始二进制（-c 256 避免 xxd 默认换行）
+openssl dgst -sm3 -binary message.bin | xxd -p -c 256
+```
+
+### SM4 对称加密（`openssl enc`）
+
+`openssl enc` 支持 ECB/CBC/CFB/OFB/CTR，**不支持 GCM/CCM/XTS**。
+
+```bash
+KEY=0123456789abcdeffedcba9876543210
+IV=00000000000000000000000000000000
+
+# ECB（无 IV）
+openssl enc -sm4-ecb -K $KEY -nosalt -nopad -in pt.bin -out ct.bin
+
+# CBC / CFB / OFB / CTR
+for mode in cbc cfb ofb ctr; do
+  openssl enc -sm4-$mode -K $KEY -iv $IV -nosalt -nopad -in pt.bin -out ct.bin
+done
+
+# 解密时追加 -d
+openssl enc -sm4-cbc -d -K $KEY -iv $IV -nosalt -nopad -in ct.bin -out pt.bin
+```
+
+### SM2 密钥操作
+
+```bash
+# 生成 SM2 私钥
+openssl ecparam -genkey -name SM2 -out sm2.pem
+
+# 查看私钥/公钥
+openssl ec -in sm2.pem -text -noout
+openssl ec -in sm2.pem -pubout -out sm2_pub.pem
+```
+
+### SM2 签名与验签
+
+```bash
+# 签名（默认空 ID，与系统 openssl 默认一致）
+openssl dgst -sm3 -sign sm2.pem -out sig.bin message.bin
+
+# 验签（默认空 ID）
+openssl dgst -sm3 -verify sm2_pub.pem -signature sig.bin message.bin
+
+# 使用国密推荐 ID 签名/验签（与 utils.py、gmssl 默认一致）
+ID=1234567812345678
+openssl pkeyutl -sign -in message.bin -inkey sm2.pem -out sig.bin \
+    -rawin -digest sm3 -pkeyopt distid:$ID
+
+openssl pkeyutl -verify -in message.bin -inkey sm2.pem -sigfile sig.bin \
+    -rawin -digest sm3 -pkeyopt distid:$ID
+```
+
+### SM2 证书与 CSR
+
+```bash
+# 生成 CSR
+openssl req -new -key sm2.pem -out sm2.csr -nodes -subj "/CN=test" -sm3
+
+# 自签名证书
+openssl req -x509 -key sm2.pem -in sm2.csr -out sm2_cert.pem -days 365 -sm3
+```
+
+### 与仓库辅助程序的对应关系
+
+| 操作 | `openssl` CLI | `openssl_sm_helper` |
+|------|---------------|---------------------|
+| SM3 | `openssl dgst -sm3` | `sm3 <data_hex>` |
+| SM4 ECB/CBC/CFB/OFB/CTR | `openssl enc -sm4-<mode>` | `sm4 <mode> enc/dec <key> <iv> <data>` |
+| SM4 GCM/CCM/XTS | 不支持 CLI | `sm4_gcm ...` / `sm4_ccm ...` / `sm4 xts ...` |
+| SM2 公钥派生 | `openssl ec -pubout` | `sm2_pubkey <d_hex>` |
+| SM2 签名（空 ID） | `openssl dgst -sm3 -sign` | `sm2_sign <d_hex> <msg_hex>` |
+| SM2 签名（国密 ID） | `openssl pkeyutl ... -pkeyopt distid:...` | `sm2_sign <d_hex> <msg_hex> 1234567812345678` |
